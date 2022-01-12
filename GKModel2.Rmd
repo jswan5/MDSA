@@ -1,0 +1,274 @@
+---
+title: "GK Correlations"
+author: "Jordan Swanson"
+date: "November 28, 2021"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(stats)
+library(lmtest)
+library(GGally)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(olsrr)
+library(car)
+library(MASS)
+```
+Read in data, filter by position
+```{r}
+data = read.csv("transfermarkt_fbref_201920.csv", sep=";")
+gk_data = data[which (data$position == "GK"),]
+```
+To get an idea of which variables are worth considering, we'll individually run correlations between *value* and the other variables in the dataset:
+
+Remove non-numerical fields, run correlations
+```{r}
+gk_num_data = Filter(is.numeric,gk_data)
+gkcors = as.data.frame(cor(gk_num_data, gk_num_data$value))
+```
+
+To consider negative correlations, we'll add a column determining absolute value of correlations and sort by it before looking at the top correlations:
+```{r}
+gkcors$abs_value = with(gkcors, abs(gkcors$V1))
+gkcors_sorted = gkcors[order(-gkcors$abs_value),]
+top_cors_gk = head(gkcors_sorted,20)
+print(top_cors_gk)
+```
+All of the top 20 correlations are positive *r* values, so going forward we can ignore the absolute value requirement for sorting.
+
+Now that know which variables to use to predict the model, we can bring back in the categorical variables and create a filtered dataset. We've also included the variable *saves*, as it seems logical that it may predict a goalkeeper's value.
+```{r}
+top_fields = c("value","wins_gk","clean_sheets","passes_ground",
+               "passes_medium","passes_completed_medium","saves","games_starts",
+               "games","minutes","league","nationality","CL")
+top_gk_data = gk_data[top_fields]
+```
+We can plot boxplots of the various factors (and bar charts for the categorical and binary) to see what the data looks like:
+```{r}
+boxplot(top_gk_data$value,main="Value")
+boxplot(top_gk_data$wins_gk,main="wins_gk")
+boxplot(top_gk_data$clean_sheets,main="clean_sheets")
+boxplot(top_gk_data$passes_ground,main="passes_ground")
+boxplot(top_gk_data$passes_medium,main="passes_medium")
+boxplot(top_gk_data$passes_completed_medium,main="passes_completed_medium")
+boxplot(top_gk_data$games_starts,main="games_starts")
+boxplot(top_gk_data$saves,main="saves")
+boxplot(top_gk_data$games,main="games")
+boxplot(top_gk_data$minutes,main="minutes")
+```
+```{r}
+ggplot(top_gk_data, aes(y=factor(league))) + geom_bar()
+ggplot(top_gk_data, aes(y=factor(nationality))) + geom_bar()
+ggplot(top_gk_data, aes(y=factor(CL))) + geom_bar()
+```
+Before we proceed too far, we need to ensure that our independent variables are truly independent. We can test for multicollinearity by plotting pairs of variables and checking for correlation. For this stage, we've excluded the categorical data:
+```{r}
+num_fields = c("value","wins_gk","clean_sheets","passes_ground",
+               "passes_medium","passes_completed_medium","saves","games_starts",
+               "games","minutes")
+top_gk_data_num = top_gk_data[num_fields]
+print(cor(top_gk_data_num))
+```
+Looking at the above $r$ values, there's good evidence that we don't need to include all three variables of (games, minutes, games_starts), or (passes_medium, passes_completed_medium, passes_ground) as they're incredibly highly correlated ($r$>0.999). We'll drop games_starts, minutes, passes_medium, and passes_medium_completed from the model:
+
+```{r}
+gk_full_model = lm(value~wins_gk+clean_sheets+passes_ground+saves+games+
+                         factor(CL)+factor(league),data=top_gk_data)
+summary(gk_full_model)
+```
+
+There are a mix of significant and non-significant variables, though the model itself is significant. Let's employ some step-wise linear regression model selection to see if we can improve upon the $R^2_adj$ of 0.499:
+```{r}
+gk_red1_model = ols_step_both_p(gk_full_model,details=TRUE)
+```
+
+Using the results of the above step-wise selection, we have a few variables that are still above our $\alpha=0.05$, though we have achieved an $R^2_{adj}$ of 0.501. We can remove those variables (wins_gk, saves, CL) and see how the models compare:
+
+$H_0$: The removed variables have a $\beta_i=0$\
+$H_a$: At least one of the removed variables has predictive value ($\beta_i\neq0$)\
+```{r}
+gk_sw_model1 = lm(value~wins_gk+saves+passes_ground+clean_sheets+factor(CL)+factor(league),data=top_gk_data)
+gk_sw_red1 = lm(value~passes_ground+clean_sheets+factor(league),data=top_gk_data)
+anova(gk_sw_model1,gk_sw_red1)
+```
+With a $p<0.0001$, we can reject the null hypothesis and accept that the model has independent variables that are significantly different than 0, and should be kept in the model.
+
+Therefore, our final model is:
+```{r}
+gk_final = lm(value~wins_gk+saves+passes_ground+clean_sheets+factor(CL)+factor(league),data=top_gk_data)
+summary(gk_final)
+```
+Let's test for model assumptions:
+
+Normality:
+
+$H_0$: The data is significantly normally distributed\
+$H_a$: The data is not significantly distributed\
+```{r}
+par(mfrow=c(2,2))
+plot(gk_final,which=c(1,2,3,5))
+#hist(residuals(gk_final),main="Histogram of Residuals",breaks=10)
+shapiro.test(residuals(gk_final))
+```
+The histogram, Q-Q plot, and Shapiro-Wilk test all reveal that we have enough evidence to reject the null hypothesis, and accept that the data is not normally distributed.
+
+
+Linearity:
+```{r}
+plot(gk_final,which=1)
+```
+The plot shows no significant evidence of non-linearity.
+
+Homoscedasticity:
+
+$H_0$: The data have equal variances (homoscedasticity)\
+$H_a$: The data do not exhibit equal variance (heteroscedasticity)\
+
+```{r}
+qplot(residuals(gk_final),
+geom="histogram",
+binwidth=1000000,
+main="Histogram of Residuals",
+xlab="Residuals")
+plot(gk_final,which=2:3)
+bptest(gk_final)
+```
+With a $p$-value of $p<0.001$ from the Breusch-Pagan test, it appears that this model does not meet the assumption of homoscedasticity, and we will have to accommodate that.
+
+Box-Cox transformation of the data:
+```{r}
+gk_final_bc = boxcox(gk_final,lambda=seq(-2,4))
+gk_lambda = gk_final_bc$x[which(gk_final_bc$y==max(gk_final_bc$y))]
+print(gk_lambda) # Ideal value for lambda
+```
+We can take the ideal $\lambda$ of 0.1818, and transform the independent variables:
+
+```{r}
+gk_final_bc2 = lm(((value^(gk_lambda)-1)/(gk_lambda))~wins_gk+saves+passes_ground+clean_sheets+
+                    factor(CL)+factor(league),data=top_gk_data)
+summary(gk_final_bc2)
+```
+Let's test our assumptions again of normality and equal variance:
+
+Normality:
+
+$H_0$: The data is significantly normally distributed\
+$H_a$: The data is not significantly distributed\
+```{r}
+plot(gk_final_bc2,which=1:2)
+hist(residuals(gk_final_bc2),main="Histogram of Residuals",breaks=10)
+shapiro.test(residuals(gk_final_bc2))
+```
+The transformed model (with $p=0.1941$) does not have evidence to support the presence of non-normality in the residuals of the model.
+
+Homoscedasticity:
+
+$H_0$: The data have equal variances (homoscedasticity)\
+$H_a$: The data do not exhibit equal variance (heteroscedasticity)\
+
+```{r}
+plot(gk_final_bc2,which=3)
+bptest(gk_final_bc2)
+```
+With $p=0.1121$, the transformed model no longer shows evidence of heteroscedasticity. We accept the null hypothesis of equal variance.
+
+
+```{r}
+par(mfrow=c(2,2))
+plot(gk_final_bc2,which=c(1,2,3,5))
+#hist(residuals(gk_final),main="Histogram of Residuals",breaks=10)
+shapiro.test(residuals(gk_final_bc2))
+```
+
+Multicollinearity:
+
+```{r}
+vif(gk_final_bc2)
+```
+With the highest VIF value still following well below the (conservative) cutoff of 5, there's little evidence to indicate the presence of multicollinearity in this model.
+
+Independence:
+
+As there's no time series component to the data, the independence of the measured variables 
+
+Final:
+
+We have developed a model that predicts goalkeeper value in the following form:
+```{r}
+summary(gk_final_bc2)
+```
+
+$$
+value^{\lambda}_{gk} = 35.7496 + 1.66451wins\_gk + 0.03031saves + 0.03456passes\_ground + 1.12739clean\_sheets \\ + 6.44425CL + 9.56209La Liga + 5.04161Ligue 1 + 12.51671Premier League + 1.28134Serie A
+$$
+where:\
+
+$wins\_gk$ = Wins when player is goalkeeper\
+$saves$ = Number of saves per season\
+$passes\_ground$ = Player's ground passes\
+$clean\_sheets$ = Player's clean sheets (shutouts)\
+$CL$ = Player's team participated in previous season's UEFA Champion's League (1=True)\
+$La Liga$ = Player plays in Spanish La Liga (1=True)\
+$Ligue 1$ = Player plays in French Ligue 1 (1=True)\
+$Premier League$ = Player plays in English Premier League (1=True)\
+$Serie A$ = Player plays in Italian Serie A (1=True)\
+
+In conclusion, we can see that there are very few on-field measures of a goalkeeper's performance that can be directly attributed to their value. Many of the variables that remained into the final model are not solely measuring the influence of the goalkeeper, but the entire team. Perhaps an argument can be made that strategies and tactics employed by the best goalkeepers aren't easy to measure (such as defensive positioning), and could potentially even decrease measures such as saves and ground passes. At the same time, a great goalkeeper that has a poor defense in front of him will have lower chance of achieving clean sheets, wins, and participation in prestigious tournaments like Champion's League. At the end of the day, we've created a model with an $R^2_{adj}$ of **0.5798**, and a fair portion of the variation in player value (>40\%) is still left unexplained. It may be that a multiple regression equation, even with this fairly rich dataset, is at best a mediocre way to estimate value.
+
+```{r}
+plot(gk_final_bc2,which=4:5)
+
+
+gk_lev = hatvalues(gk_final_bc2)
+gk_outliers = gk_lev[gk_lev>0.12]
+print(gk_outliers)
+plot(gk_lev,main="Leverage in GK Model")
+abline(h=0.12)
+```
+
+```{r}
+library(Metrics)
+rmse(top_gk_data$value, gk_final_bc2$residuals)
+```
+
+```{r}
+BCTransformInverse <- function(yt, lambda=0) {
+    if (lambda == 0L) { exp(yt) }
+    else { exp(log(1 + lambda * yt)/lambda) }
+}
+```
+
+```{r}
+valuebc = BCTransformInverse(35.7496, 0.1818)
+winsgkbc = BCTransformInverse(1.66451, 0.1818)
+savesbc = BCTransformInverse(0.03031, 0.1818)
+passesbc = BCTransformInverse(0.03456, 0.1818)
+cleansheetsbc = BCTransformInverse(1.12739, 0.1818)
+clbc = BCTransformInverse(6.44425, 0.1818)
+laligabc = BCTransformInverse(9.56209, 0.1818)
+ligue1bc = BCTransformInverse(5.04161, 0.1818)
+plbc = BCTransformInverse(12.51671, 0.1818)
+serieabc = BCTransformInverse(1.28134, 0.1818)
+
+print(valuebc)
+print(winsgkbc)
+print(savesbc)
+print(passesbc)
+print(cleansheetsbc)
+print(clbc)
+print(laligabc)
+print(ligue1bc)
+print(plbc)
+print(serieabc)
+```
+
+$$
+value_{gk} = 65026.15 + 4.280934wins\_gk + 1.030688saves + 1.035052passes\_ground + 2.788644clean\_sheets \\ + 71.1927CL + 254.9547La Liga + 35.81249Ligue 1 + 682.8698Premier League + 3.164065Serie A
+$$
+
+
